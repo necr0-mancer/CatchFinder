@@ -13,6 +13,7 @@ import ida_xref
 import ida_funcs
 import ida_kernwin
 
+# ======================= .PDATA EXCEPTION =======================
 
 UNN_FLAG_ERROR     = -0x01
 UNW_FLAG_NHANDLER  = 0x00
