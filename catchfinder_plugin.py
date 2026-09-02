@@ -1,5 +1,3 @@
-
-
 import ida_idaapi
 import ida_kernwin
 import ida_segment
