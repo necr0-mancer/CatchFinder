@@ -14,6 +14,7 @@ import ida_funcs
 import ida_kernwin
 
 # ======================= .PDATA EXCEPTION =======================
+# ================================================================
 
 UNN_FLAG_ERROR     = -0x01
 UNW_FLAG_NHANDLER  = 0x00
@@ -56,9 +57,9 @@ class UnwindInfoChooser(ida_kernwin.Choose):
             self,
             title,
             [
-                ["EA", 16],
                 ["ExceptionHandler", 16],
                 ["ExceptionData", 16],
+                ["dispOfHandler(catch-block)", 16],
             ],
             flags=ida_kernwin.Choose.CH_CAN_REFRESH,
         )
@@ -68,8 +69,20 @@ class UnwindInfoChooser(ida_kernwin.Choose):
     def OnGetLine(self, n):
         return self.items[n]
     def OnSelectLine(self, n):
-        ea = int(self.items[n][0],16)
-        ida_kernwin.jumpto(ea)
+
+        ea1, ea2, ea3 = self.items[n]
+
+        res = ida_kernwin.ask_buttons(
+            f"{ea1}", f"{ea2}", f"{ea3}", 0,
+            "Select an address to navigate to"
+        )
+
+        if res == 0:
+            ida_kernwin.jumpto(int(ea1,16))
+        elif res == 1:
+            ida_kernwin.jumpto(int(ea2,16))
+        elif res == -1:
+            ida_kernwin.jumpto(int(ea3,16))
     
 
     
@@ -89,6 +102,130 @@ def XREF_CALL(ea_):
             if call_fun:
                 xref_array.append((call_ea, call_fun.start_ea))
     return xref_array
+
+# FH4 compressed integer:
+#   xxx0 -> 1 byte, xx01 -> 2 bytes, x011 -> 3 bytes, 0111 -> 4 bytes, 1111 -> 5 bytes
+def read_compressed_uint(ea):
+    b0 = ida_bytes.get_byte(ea)
+    if (b0 & 0x01) == 0:            # xxx0 -> 1 byte
+        return (b0 >> 1), 1
+    elif (b0 & 0x03) == 0x01:       # xx01 -> 2 bytes
+        return ((b0 >> 2) | (ida_bytes.get_byte(ea + 1) << 6)), 2
+    elif (b0 & 0x07) == 0x03:       # x011 -> 3 bytes
+        return ((b0 >> 3) |
+                (ida_bytes.get_byte(ea + 1) << 5) |
+                (ida_bytes.get_byte(ea + 2) << 13)), 3
+    elif (b0 & 0x0F) == 0x07:       # 0111 -> 4 bytes
+        return ((b0 >> 4) |
+                (ida_bytes.get_byte(ea + 1) << 4) |
+                (ida_bytes.get_byte(ea + 2) << 12) |
+                (ida_bytes.get_byte(ea + 3) << 20)), 4
+    else:                           # 1111 -> 5 bytes, full 32-bit value in tail
+        return ida_bytes.get_dword(ea + 1), 5
+
+# ea_ is ExceptionData
+def FuncInfo4_Parser(ea_, ExceptionHandler, ExceptionData):
+    class FuncInfoHeader:           # bits: lowest bit = first field
+        def __init__(self, ea_):
+            header             = ida_bytes.get_byte(ea_)
+            self.isCatch       = header & 1
+            self.isSeparated   = header >> 1 & 1
+            self.BBT           = header >> 2 & 1
+            self.UnwindMap     = header >> 3 & 1
+            self.TryBlockMap   = header >> 4 & 1
+            self.EHs           = header >> 5 & 1
+            self.NoExcept      = header >> 6 & 1
+            self.reserved      = header >> 7 & 1
+
+    header = FuncInfoHeader(ea_)
+    ea_    += 1 # +FuncInfoHeader
+
+    image_base = ida_nalt.get_imagebase()
+    dispUnwindMap    = 0
+    dispTryBlockMap  = 0
+    dispIPtoStateMap = 0
+    dispFrame        = 0
+
+    if(header.BBT):
+        # bbtFlags - compressed uint32
+        bbtFlags, sz = read_compressed_uint(ea_)
+        ea_ += sz
+    if(header.UnwindMap):
+        dispUnwindMap    = ida_bytes.get_dword(ea_)
+        ea_ += 4 # int32_t (4 bytes)
+    if(header.TryBlockMap):
+        dispTryBlockMap  = ida_bytes.get_dword(ea_)
+        ea_ += 4 # int32_t (4 bytes)
+    # dispIPtoStateMap - always present
+    dispIPtoStateMap = ida_bytes.get_dword(ea_)
+    ea_ += 4 # int32_t (4 bytes)
+    if(header.isCatch):
+        # dispFrame - compressed uint32
+        dispFrame, sz = read_compressed_uint(ea_)
+        ea_ += sz
+
+    # TryBlockMap -> HandlerMap
+    if(header.TryBlockMap and dispTryBlockMap != 0):
+        ea_TryBlockMap = image_base + dispTryBlockMap
+        NumEntries, sz = read_compressed_uint(ea_TryBlockMap)
+        ea_TryBlockMap += sz
+
+        if NumEntries > 0x1000: # sanity
+            print(f"[!] suspicious TryBlockMap NumEntries={hex(NumEntries)} at {hex(ea_TryBlockMap)}")
+            return
+
+        for _ in range(NumEntries):
+            # tryLow/tryHigh/catchHigh - compressed (state + 1), dispHandlerArray - int32 RVA
+            tryLow,    sz = read_compressed_uint(ea_TryBlockMap); ea_TryBlockMap += sz
+            tryHigh,   sz = read_compressed_uint(ea_TryBlockMap); ea_TryBlockMap += sz
+            catchHigh, sz = read_compressed_uint(ea_TryBlockMap); ea_TryBlockMap += sz
+            dispHandlerArray = ida_bytes.get_dword(ea_TryBlockMap); ea_TryBlockMap += 4
+
+            if dispHandlerArray == 0:
+                continue
+
+            ea_HandlerMap = image_base + dispHandlerArray
+            NumEntries_HandlerMap, sz = read_compressed_uint(ea_HandlerMap)
+            ea_HandlerMap += sz
+
+            if NumEntries_HandlerMap > 0x1000: # sanity
+                print(f"[!] suspicious HandlerMap NumEntries={hex(NumEntries_HandlerMap)} at {hex(ea_HandlerMap)}")
+                continue
+
+            for _h in range(NumEntries_HandlerMap):
+                class HandlerTypeHeader: # bits: lowest bit = first field
+                    def __init__(self, ea_):
+                        header            = ida_bytes.get_byte(ea_)
+                        self.adjectives   = header & 1
+                        self.dispType     = header >> 1 & 1
+                        self.dispCatchObj = header >> 2 & 1
+                        self.contIsRVA    = header >> 3 & 1
+                        self.contAddr     = header >> 4 & 3
+                        self.unused       = header >> 6 & 3
+
+                head_HandlerMap = HandlerTypeHeader(ea_HandlerMap)
+                ea_HandlerMap += 1
+
+                if(head_HandlerMap.adjectives):      # compressed
+                    val, sz = read_compressed_uint(ea_HandlerMap); ea_HandlerMap += sz
+                if(head_HandlerMap.dispType):        # int32
+                    dispType = ida_bytes.get_dword(ea_HandlerMap); ea_HandlerMap += 4
+                if(head_HandlerMap.dispCatchObj):    # compressed
+                    val, sz = read_compressed_uint(ea_HandlerMap); ea_HandlerMap += sz
+                # dispOfHandler - always present, int32 RVA
+                dispOfHandler = ida_bytes.get_dword(ea_HandlerMap); ea_HandlerMap += 4
+                # continuation addresses: count = contAddr
+                for _c in range(head_HandlerMap.contAddr):
+                    if head_HandlerMap.contIsRVA:    # 4-byte RVA
+                        cont = ida_bytes.get_dword(ea_HandlerMap); ea_HandlerMap += 4
+                    else:                            # compressed, function-relative
+                        cont, sz = read_compressed_uint(ea_HandlerMap); ea_HandlerMap += sz
+
+                catch_address = image_base + dispOfHandler
+                print(f"[+] dispOfHandler: {hex(catch_address)}")
+                result.append([hex(ExceptionHandler), hex(ExceptionData), hex(catch_address)])
+
+
 
 def RUNTIME_FUNCTION(ea, xref_array):
 
@@ -173,30 +310,31 @@ def RUNTIME_FUNCTION(ea, xref_array):
                 
                 addidation_code = UWOP_PUSH_NONVOL
 
-        # ================ ALIGN 4 =========================
-        ea += 1
-        if CntUnwindCodes % 2 != 0:
-            ea += 2 # align 2 
-        # ==================================================
-        
+        # ================ handler area (aligned to 4) ================
+        image_base       = ida_nalt.get_imagebase()
+        handler_offset = (4 + 2 * CntUnwindCodes + 3) & ~3
+        handler_ea     = unwind_info + handler_offset
 
         if flags == UNW_FLAG_NHANDLER:
             print(f'[!] Flags={hex(flags)}:UNW_FLAG_NHANDLER(0) __try/__except, __try/__finally None')
             return UNW_FLAG_NHANDLER
 
         if flags & UNW_FLAG_CHAININFO:
-            return UNWIND_(ea)
+            # chained RUNTIME_FUNCTION: BeginAddress, EndAddress, UnwindData
+            chained_unwind = image_base + ida_bytes.get_dword(handler_ea + 8)
+            return UNWIND_(ea, unwind_info=chained_unwind)
 
         if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER):
-            # ====================== Payload ================================== 
-            image_base       = ida_nalt.get_imagebase()
-            ExceptionHandler = image_base + ida_bytes.get_dword(ea)
-            ExceptionData    = image_base + ida_bytes.get_dword(ea + 4)
-            # ================================================================= 
+            # ====================== Payload ==================================
+            ExceptionHandler = image_base + ida_bytes.get_dword(handler_ea)
+            ExceptionData    = image_base + ida_bytes.get_dword(handler_ea + 4)
+            # =================================================================
             # ea_, ExceptionHandler, ExceptionData
 
             print(f'[+] ExceptionHandler={hex(ExceptionHandler)} ExceptionData={hex(ExceptionData)}')
-            result.append([hex(ea_), hex(ExceptionHandler), hex(ExceptionData)])
+            FuncInfo4_Parser(ExceptionData, ExceptionHandler, ExceptionData)
+
+            #result.append([hex(ea_), hex(ExceptionHandler), hex(ExceptionData)])
 
             return (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)
         
